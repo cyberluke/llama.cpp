@@ -481,6 +481,13 @@ struct server_metrics {
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // media token budget counters, mirrored from the mtmd context (see mtmd_get_counters)
+    uint64_t mtmd_media_budget_adapt_total        = 0;
+    uint64_t mtmd_media_budget_reject_total       = 0;
+    uint64_t mtmd_atomic_capacity_violation_total = 0;
+    uint64_t mtmd_dynamic_resize_total            = 0;
+    uint64_t mtmd_dynamic_tiling_total            = 0;
+
     void init() {
         t_start = ggml_time_us();
     }

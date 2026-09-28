@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "clip-model.h"
+#include "mtmd.h"
 
 #include <vector>
 #include <string>
@@ -16,6 +17,11 @@ struct mtmd_image_preproc_out {
     int grid_x = 0;
     int grid_y = 0;
 
+    // true if the preprocessor adapted the media to a runtime token budget
+    bool adapted = false;
+    // budget strategy that performed the adaptation
+    mtmd_media_budget_strategy adapted_strategy = MTMD_MEDIA_BUDGET_FIXED;
+
     void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);
     void append(const clip_hparams & hparams, clip_image_f32 & img, bool normalized = true);
@@ -28,9 +34,13 @@ struct mtmd_image_preproc_out {
 
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
+    const clip_ctx * ctx;
     const clip_hparams & hparams;
+    // how this preprocessor may adapt the media to a token budget
+    mtmd_media_budget_strategy budget_strategy = MTMD_MEDIA_BUDGET_FIXED;
 
-    mtmd_image_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)) {}
+    mtmd_image_preprocessor(const clip_ctx * ctx, mtmd_media_budget_strategy strategy = MTMD_MEDIA_BUDGET_FIXED)
+        : ctx(ctx), hparams(*clip_get_hparams(ctx)), budget_strategy(strategy) {}
 
     virtual ~mtmd_image_preprocessor() = default;
     virtual mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const = 0;
@@ -58,7 +68,7 @@ struct mtmd_image_preprocessor {
  * NOTE: for the ordering of overview, set "ov_img_first" on the mtmd_context
  */
 struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_llava_uhd(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_llava_uhd(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_TILING) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 
     struct slice_coordinates {
@@ -119,20 +129,30 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx, int32_t runtime_max_output_tokens = -1)
+        : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE),
+          runtime_max_output_tokens(runtime_max_output_tokens) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+
+    // maximum number of output tokens for one media block, -1 = disabled
+    int32_t runtime_max_output_tokens = -1;
 };
 
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
 // ref: inference/image_processor.py in the HF repo (DeepSeek-V4-Flash-Vision)
 struct mtmd_image_preprocessor_deepseek4v : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_deepseek4v(const clip_ctx * ctx, int32_t runtime_max_output_tokens = -1)
+        : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE),
+          runtime_max_output_tokens(runtime_max_output_tokens) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+
+    // maximum number of output tokens for one media block, -1 = disabled
+    int32_t runtime_max_output_tokens = -1;
 
 private:
     struct grid_info {
@@ -188,7 +208,7 @@ struct mtmd_image_preprocessor_internvl : mtmd_image_preprocessor_llava_uhd {
 // DeepSeek-OCR (v1/v2) global view + optional local tile grid
 struct mtmd_image_preprocessor_deepseekocr : mtmd_image_preprocessor {
     mtmd_image_preprocessor_deepseekocr(const clip_ctx * ctx)
-        : mtmd_image_preprocessor(ctx),
+        : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_TILING),
             fuse_row(clip_get_projector_type(ctx) == PROJECTOR_TYPE_DEEPSEEKOCR),
           base_size(hparams.image_size),
           tile_size(hparams.preproc_tile_size),
@@ -240,7 +260,7 @@ private:
 };
 
 struct mtmd_image_preprocessor_youtuvl : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_youtuvl(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_youtuvl(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
@@ -252,6 +272,6 @@ struct mtmd_image_preprocessor_granite : mtmd_image_preprocessor_llava_uhd {
 
 // pick the patch grid closest to the input aspect ratio under the per-image token cap, stretch-resize.
 struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx, MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };

@@ -58,6 +58,66 @@ enum mtmd_input_chunk_type {
     MTMD_INPUT_CHUNK_TYPE_COUNT, // for validation
 };
 
+// how a media block may be consumed by the LLM decoder
+enum mtmd_decode_granularity {
+    MTMD_DECODE_GRANULARITY_CHUNKABLE, // may be split across decoder micro-batches
+    MTMD_DECODE_GRANULARITY_ATOMIC,    // must be decoded as one indivisible block
+};
+
+// how the preprocessor may adapt a media block to a token budget
+enum mtmd_media_budget_strategy {
+    MTMD_MEDIA_BUDGET_FIXED,           // fixed representation, no adaptation
+    MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE,  // aspect-preserving resize to fit the budget
+    MTMD_MEDIA_BUDGET_DYNAMIC_TILING,  // native tiling strategy adapts to the budget
+};
+
+// maximum size of one indivisible decoder block, in tokens
+struct mtmd_decode_constraints {
+    int32_t max_atomic_tokens; // 0 = unspecified
+};
+
+// media preprocessing capabilities of a loaded model
+struct mtmd_media_capabilities {
+    enum mtmd_decode_granularity decode_granularity;
+    enum mtmd_media_budget_strategy budget_strategy;
+
+    bool supports_runtime_token_budget; // preprocessor can honor a runtime token cap
+    bool supports_tiling;               // preprocessor can retile the media
+};
+
+// combined media token budget: model, user and runtime limits
+struct mtmd_media_token_budget {
+    int32_t model_min;
+    int32_t model_max;
+
+    int32_t user_min;
+    int32_t user_max;
+
+    int32_t runtime_atomic_max;
+
+    int32_t effective_min;
+    int32_t effective_max;
+};
+
+// media budget counters, cumulative since context initialization
+struct mtmd_counters {
+    uint64_t media_budget_adapt_total;        // media adapted to fit a runtime budget
+    uint64_t media_budget_reject_total;       // media rejected by the budget (structured errors)
+    uint64_t atomic_capacity_violation_total; // ATOMIC media exceeded the runtime capacity
+    uint64_t dynamic_resize_total;            // DYNAMIC_RESIZE adaptations
+    uint64_t dynamic_tiling_total;            // DYNAMIC_TILING adaptations
+};
+
+// structured error codes for media processing, returned by mtmd_tokenize(),
+// mtmd_encode_chunk() and the mtmd-helper decode functions
+enum mtmd_error {
+    MTMD_ERROR_NONE = 0,
+    MTMD_ERROR_ATOMIC_MEDIA_TOO_LARGE        = 3, // atomic media block exceeds decoder capacity
+    MTMD_ERROR_MEDIA_BUDGET_BELOW_MODEL_MINIMUM = 4, // runtime capacity below architectural minimum
+    MTMD_ERROR_MEDIA_ADAPTATION_FAILED       = 5, // preprocessor could not adapt the media to the budget
+    MTMD_ERROR_MEDIA_TOKEN_COUNT_MISMATCH    = 6, // predicted token count does not match the actual count
+};
+
 // opaque types
 struct mtmd_context;
 struct mtmd_bitmap;
@@ -117,6 +177,11 @@ struct mtmd_context_params {
                               // (note: this is not a hard-limit, the first image will always be added even if it exceeds this limit)
                               // (default: 1024)
 
+    // semantic limit on the decoder: maximum size of one indivisible media block
+    // in tokens. 0 = unspecified. This is a correctness limit for ATOMIC media,
+    // it is NOT the MTMD encoder batch size.
+    struct mtmd_decode_constraints decode_constraints;
+
     // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
     // If the provided progress_callback returns true, model loading continues.
     // If it returns false, model loading is immediately aborted.
@@ -139,6 +204,21 @@ MTMD_API void mtmd_free(mtmd_context * ctx);
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk
 MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);
+
+// decode granularity of a media block: whether it can be split across decoder
+// micro-batches (CHUNKABLE) or must be decoded as one indivisible block (ATOMIC)
+// if chunk is nullptr, we assume the default case where chunk is an image chunk
+MTMD_API enum mtmd_decode_granularity mtmd_get_decode_granularity(const mtmd_context * ctx, const mtmd_input_chunk * chunk);
+
+// media preprocessing capabilities of the loaded model
+MTMD_API struct mtmd_media_capabilities mtmd_get_media_capabilities(const mtmd_context * ctx, enum mtmd_input_chunk_type media_type);
+
+// combined media token budget: model, user and runtime limits
+// values are in media tokens; 0 or negative means "unspecified"
+MTMD_API struct mtmd_media_token_budget mtmd_get_media_token_budget(const mtmd_context * ctx, enum mtmd_input_chunk_type media_type);
+
+// media budget counters, cumulative since context initialization
+MTMD_API struct mtmd_counters mtmd_get_counters(const mtmd_context * ctx);
 
 // whether the current model use M-RoPE for llama_decode
 MTMD_API bool mtmd_decode_use_mrope(const mtmd_context * ctx);
@@ -299,6 +379,7 @@ MTMD_API struct mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_im
 //   0 on success
 //   1 on number of bitmaps not matching the number of markers
 //   2 on media preprocessing error
+//   otherwise, one of the mtmd_error codes (e.g. MTMD_ERROR_ATOMIC_MEDIA_TOO_LARGE)
 MTMD_API int32_t mtmd_tokenize(const mtmd_context * ctx,
                                mtmd_input_chunks * output,
                                const mtmd_input_text * text,

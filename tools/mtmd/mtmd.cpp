@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -470,10 +471,65 @@ mtmd_context_params mtmd_context_params_default() {
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
         /* batch_max_tokens  */ 1024,
+        /* decode_constraints */ { 0 },
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
     };
     return params;
+}
+
+//
+// media capability classification
+//
+// single source of truth for decode granularity (ATOMIC vs CHUNKABLE) and
+// media budget strategy; used by both preprocessing budget selection and the
+// decode-time guard
+//
+
+static mtmd_decode_granularity mtmd_get_decode_granularity_impl(
+        projector_type proj_v,
+        projector_type proj_a,
+        int32_t n_embd_text,
+        mtmd_input_chunk_type media_type) {
+    projector_type proj = proj_v;
+    if (media_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        proj = proj_a;
+    }
+    switch (proj) {
+        case PROJECTOR_TYPE_GEMMA4V:
+            // E2B (n_embd = 1536) and E4B (n_embd = 2560) always use causal
+            return (n_embd_text == 1536 || n_embd_text == 2560)
+                ? MTMD_DECODE_GRANULARITY_CHUNKABLE
+                : MTMD_DECODE_GRANULARITY_ATOMIC;
+        case PROJECTOR_TYPE_GEMMA4UV:
+        case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_DEEPSEEK4V:
+            return MTMD_DECODE_GRANULARITY_ATOMIC;
+        default:
+            return MTMD_DECODE_GRANULARITY_CHUNKABLE;
+    }
+}
+
+static const char * mtmd_granularity_name(mtmd_decode_granularity g) {
+    switch (g) {
+        case MTMD_DECODE_GRANULARITY_CHUNKABLE: return "chunkable";
+        case MTMD_DECODE_GRANULARITY_ATOMIC:    return "atomic";
+    }
+    return "unknown";
+}
+
+static const char * mtmd_budget_strategy_name(mtmd_media_budget_strategy s) {
+    switch (s) {
+        case MTMD_MEDIA_BUDGET_FIXED:          return "fixed";
+        case MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE: return "dynamic_resize";
+        case MTMD_MEDIA_BUDGET_DYNAMIC_TILING: return "dynamic_tiling";
+    }
+    return "unknown";
+}
+
+static const char * mtmd_projector_name(projector_type proj) {
+    auto it = PROJECTOR_TYPE_NAMES.find(proj);
+    return it != PROJECTOR_TYPE_NAMES.end() ? it->second.c_str() : "unknown";
 }
 
 struct mtmd_context {
@@ -525,6 +581,16 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // semantic decoder limit: maximum size of one indivisible media block
+    mtmd_decode_constraints decode_constraints;
+
+    // media budget counters (atomic: mtmd_tokenize is thread-safe on a shared ctx)
+    mutable std::atomic<uint64_t> cnt_media_budget_adapt{0};
+    mutable std::atomic<uint64_t> cnt_media_budget_reject{0};
+    mutable std::atomic<uint64_t> cnt_atomic_capacity_violation{0};
+    mutable std::atomic<uint64_t> cnt_dynamic_resize{0};
+    mutable std::atomic<uint64_t> cnt_dynamic_tiling{0};
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -536,7 +602,8 @@ struct mtmd_context {
         media_marker    (ctx_params.media_marker),
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
-        batch_max_tokens(ctx_params.batch_max_tokens)
+        batch_max_tokens(ctx_params.batch_max_tokens),
+        decode_constraints(ctx_params.decode_constraints)
     {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
@@ -618,6 +685,33 @@ struct mtmd_context {
         }
         if (ctx_v) {
             init_vision();
+
+            // observability: log media capabilities and the effective token budget
+            const auto caps = mtmd_get_media_capabilities(this, MTMD_INPUT_CHUNK_TYPE_IMAGE);
+            const auto budget = mtmd_get_media_token_budget(this, MTMD_INPUT_CHUNK_TYPE_IMAGE);
+            LOG_INF("%s: mtmd projector=%s decode_granularity=%s budget_strategy=%s"
+                    " model_min_tokens=%d model_max_tokens=%d"
+                    " runtime_atomic_capacity=%d effective_max_tokens=%d\n",
+                    __func__, mtmd_projector_name(proj_type_v()),
+                    mtmd_granularity_name(caps.decode_granularity),
+                    mtmd_budget_strategy_name(caps.budget_strategy),
+                    budget.model_min, budget.model_max,
+                    budget.runtime_atomic_max, budget.effective_max);
+            if (budget.runtime_atomic_max > 0
+                    && caps.decode_granularity == MTMD_DECODE_GRANULARITY_ATOMIC
+                    && budget.user_max > 0 && budget.runtime_atomic_max < budget.user_max) {
+                LOG_WRN("%s: runtime atomic capacity (%d tokens) is below the explicit"
+                        " --image-max-tokens (%d tokens); the runtime limit wins\n",
+                        __func__, budget.runtime_atomic_max, budget.user_max);
+            }
+            if (budget.runtime_atomic_max > 0
+                    && caps.decode_granularity == MTMD_DECODE_GRANULARITY_ATOMIC
+                    && budget.model_min > 0 && budget.runtime_atomic_max < budget.model_min) {
+                LOG_WRN("%s: runtime atomic capacity (%d tokens) is below the architectural"
+                        " minimum image token count (%d tokens); image requests will be"
+                        " rejected with MTMD_ERROR_MEDIA_BUDGET_BELOW_MODEL_MINIMUM\n",
+                        __func__, budget.runtime_atomic_max, budget.model_min);
+            }
         }
         if (ctx_a) {
             init_audio();
@@ -830,7 +924,7 @@ struct mtmd_context {
             case PROJECTOR_TYPE_DEEPSEEK4V:
                 {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v, image_runtime_cap());
                 } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
@@ -881,7 +975,7 @@ struct mtmd_context {
                     // <|image> ... (image embeddings) ... <image|>
                     img_beg = "<|image>";
                     img_end = "<image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v, image_runtime_cap());
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
@@ -1031,6 +1125,17 @@ struct mtmd_context {
 
     projector_type proj_type_a() const {
         return ctx_a ? clip_get_projector_type(ctx_a) : PROJECTOR_TYPE_UNKNOWN;
+    }
+
+    // runtime token cap for one atomic image block, -1 if not applicable
+    // (chunkable vision path, or no runtime constraint configured)
+    int32_t image_runtime_cap() const {
+        if (mtmd_get_decode_granularity_impl(
+                proj_type_v(), proj_type_a(), n_embd_text,
+                MTMD_INPUT_CHUNK_TYPE_IMAGE) != MTMD_DECODE_GRANULARITY_ATOMIC) {
+            return -1;
+        }
+        return decode_constraints.max_atomic_tokens > 0 ? decode_constraints.max_atomic_tokens : -1;
     }
 
     int64_t n_embd_out() const {
@@ -1350,6 +1455,29 @@ struct mtmd_tokenizer {
                 return 2;
             }
 
+            // generic media token budget: ATOMIC blocks must fit the runtime decoder
+            // capacity, and the runtime capacity must not be below the architectural
+            // minimum representation of this model
+            const int32_t runtime_atomic_max = ctx->decode_constraints.max_atomic_tokens;
+            const bool is_atomic = mtmd_get_decode_granularity_impl(
+                ctx->proj_type_v(), ctx->proj_type_a(), ctx->n_embd_text,
+                MTMD_INPUT_CHUNK_TYPE_IMAGE) == MTMD_DECODE_GRANULARITY_ATOMIC;
+            if (is_atomic && runtime_atomic_max > 0) {
+                const auto & hp = *clip_get_hparams(ctx->ctx_v);
+                const int64_t patch_area = (int64_t) hp.patch_size * hp.patch_size * hp.n_merge * hp.n_merge;
+                const int32_t model_min_tokens = patch_area > 0 && hp.image_min_pixels > 0
+                    ? (int32_t)((int64_t) hp.image_min_pixels / patch_area) : 0;
+                if (model_min_tokens > 0 && runtime_atomic_max < model_min_tokens) {
+                    LOG_ERR("%s: media cannot be represented safely with this decoder configuration:"
+                            " atomic media requires at least %d tokens, decoder capacity is %d"
+                            " (n_batch/n_ubatch too small); increase n_batch and n_ubatch or"
+                            " reduce --image-min-tokens\n",
+                            __func__, model_min_tokens, runtime_atomic_max);
+                    ctx->cnt_media_budget_reject.fetch_add(1, std::memory_order_relaxed);
+                    return MTMD_ERROR_MEDIA_BUDGET_BELOW_MODEL_MINIMUM;
+                }
+            }
+
             if (!ctx->img_beg.empty()) {
                 add_text(ctx->img_beg, true); // add image begin token
             }
@@ -1381,6 +1509,10 @@ struct mtmd_tokenizer {
                 // move entries and grid dimensions to the "global" preproc_out
                 for (auto & entry : tmp_preproc_out.entries) {
                     preproc_out.entries.emplace_back(std::move(entry));
+                }
+                preproc_out.adapted |= tmp_preproc_out.adapted;
+                if (tmp_preproc_out.adapted) {
+                    preproc_out.adapted_strategy = tmp_preproc_out.adapted_strategy;
                 }
 
                 // for llava-uhd style, we need to handle grid too
@@ -1500,6 +1632,34 @@ struct mtmd_tokenizer {
                     }
                 }
 
+                // exact post-preprocess verification: an ATOMIC media block must fit the
+                // runtime decoder capacity. this is a final invariant check, the adaptive
+                // preprocessor above already tried to make it fit
+                if (is_atomic && runtime_atomic_max > 0 && (int32_t) n_tokens > runtime_atomic_max) {
+                    LOG_ERR("%s: atomic media block too large: projector=%s granularity=%s"
+                            " tokens=%zu runtime_limit=%d source=%dx%d processed=%dx%d"
+                            " strategy=%s\n",
+                            __func__, mtmd_projector_name(ctx->proj_type_v()),
+                            mtmd_granularity_name(MTMD_DECODE_GRANULARITY_ATOMIC),
+                            n_tokens, runtime_atomic_max,
+                            bitmaps[0]->nx, bitmaps[0]->ny,
+                            preproc_out.entries[0].nx(), preproc_out.entries[0].ny(),
+                            mtmd_budget_strategy_name(ctx->image_preproc->budget_strategy));
+                    ctx->cnt_atomic_capacity_violation.fetch_add(1, std::memory_order_relaxed);
+                    ctx->cnt_media_budget_reject.fetch_add(1, std::memory_order_relaxed);
+                    return MTMD_ERROR_ATOMIC_MEDIA_TOO_LARGE;
+                }
+
+                // counters for runtime budget adaptations
+                if (preproc_out.adapted) {
+                    ctx->cnt_media_budget_adapt.fetch_add(1, std::memory_order_relaxed);
+                    if (preproc_out.adapted_strategy == MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE) {
+                        ctx->cnt_dynamic_resize.fetch_add(1, std::memory_order_relaxed);
+                    } else if (preproc_out.adapted_strategy == MTMD_MEDIA_BUDGET_DYNAMIC_TILING) {
+                        ctx->cnt_dynamic_tiling.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
                 mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
 
                 // [QWEN_VIDEO] improve this in the future
@@ -1531,6 +1691,14 @@ struct mtmd_tokenizer {
 
                 image_tokens->batch_f32 = std::move(batch_f32);
                 image_tokens->id = bitmaps[0]->id; // optional
+
+                // cache identity: when a runtime atomic budget is in effect, include the
+                // effective preprocessing representation, so a smaller runtime budget
+                // can never reuse the embeddings of a larger representation
+                if (is_atomic && runtime_atomic_max > 0) {
+                    image_tokens->id += string_format("@preproc=v1,g=%dx%d,t=%zu,b=%d",
+                        (int) image_tokens->nx, (int) image_tokens->ny, n_tokens, runtime_atomic_max);
+                }
 
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
@@ -2168,22 +2336,91 @@ float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * 
     return nullptr; // not found
 }
 
+enum mtmd_decode_granularity mtmd_get_decode_granularity(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+    mtmd_input_chunk_type media_type = MTMD_INPUT_CHUNK_TYPE_IMAGE;
+    if (chunk) {
+        media_type = chunk->type;
+    }
+    return mtmd_get_decode_granularity_impl(ctx->proj_type_v(), ctx->proj_type_a(), ctx->n_embd_text, media_type);
+}
+
 bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
-    auto proj_type = ctx->proj_type_v();
-    if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        proj_type = ctx->proj_type_a();
+    return mtmd_get_decode_granularity(ctx, chunk) == MTMD_DECODE_GRANULARITY_ATOMIC;
+}
+
+mtmd_media_capabilities mtmd_get_media_capabilities(const mtmd_context * ctx, mtmd_input_chunk_type media_type) {
+    mtmd_media_capabilities caps{};
+    if (media_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        // audio is always decoded in n_batch-sized chunks (see mtmd_helper_decode_image_chunk)
+        caps.decode_granularity = MTMD_DECODE_GRANULARITY_CHUNKABLE;
+        caps.budget_strategy    = MTMD_MEDIA_BUDGET_FIXED;
+        caps.supports_runtime_token_budget = false;
+        caps.supports_tiling = false;
+        return caps;
     }
-    switch (proj_type) {
-        case PROJECTOR_TYPE_GEMMA4V:
-            // E2B (n_embd = 1536) and E4B (n_embd = 2560) always use causal
-            return ctx->n_embd_text != 1536 && ctx->n_embd_text != 2560;
-        case PROJECTOR_TYPE_GEMMA4UV:
-        case PROJECTOR_TYPE_GEMMA3:
-        case PROJECTOR_TYPE_DEEPSEEK4V:
-            return true;
-        default:
-            return false;
+    if (!ctx->ctx_v || !ctx->image_preproc) {
+        return caps;
     }
+    caps.decode_granularity = mtmd_get_decode_granularity(ctx, nullptr);
+    caps.budget_strategy    = ctx->image_preproc->budget_strategy;
+    caps.supports_runtime_token_budget = (caps.budget_strategy == MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE);
+    caps.supports_tiling               = (caps.budget_strategy == MTMD_MEDIA_BUDGET_DYNAMIC_TILING);
+    return caps;
+}
+
+mtmd_media_token_budget mtmd_get_media_token_budget(const mtmd_context * ctx, mtmd_input_chunk_type media_type) {
+    mtmd_media_token_budget budget{};
+    if (media_type != MTMD_INPUT_CHUNK_TYPE_IMAGE || !ctx->ctx_v) {
+        return budget;
+    }
+
+    const auto & hp = *clip_get_hparams(ctx->ctx_v);
+    const int64_t patch_area = (int64_t) hp.patch_size * hp.patch_size * hp.n_merge * hp.n_merge;
+    auto tokens_from_pixels = [&](int32_t pixels) -> int32_t {
+        if (pixels <= 0 || patch_area <= 0) {
+            return 0;
+        }
+        return (int32_t)((int64_t) pixels / patch_area);
+    };
+
+    // model limits: architecture-defined, falling back to the pixel limits
+    // (which already fold in user overrides when the architecture defines no value)
+    budget.model_min = hp.model_image_min_tokens > 0 ? hp.model_image_min_tokens
+                                                      : tokens_from_pixels(hp.image_min_pixels);
+    budget.model_max = hp.model_image_max_tokens > 0 ? hp.model_image_max_tokens
+                                                      : tokens_from_pixels(hp.image_max_pixels);
+    budget.user_min = hp.custom_image_min_tokens;
+    budget.user_max = hp.custom_image_max_tokens;
+    budget.runtime_atomic_max = ctx->decode_constraints.max_atomic_tokens;
+
+    // effective lower bound: strongest positive minimum
+    budget.effective_min = std::max(budget.model_min, std::max(budget.user_min, 0));
+    // effective upper bound: weakest positive maximum. the runtime atomic capacity
+    // is a correctness limit, so it always wins when present (ATOMIC media only)
+    int32_t eff = 0;
+    auto consider = [&](int32_t v) {
+        if (v > 0 && (eff == 0 || v < eff)) {
+            eff = v;
+        }
+    };
+    consider(budget.model_max);
+    consider(budget.user_max);
+    if (mtmd_get_decode_granularity(ctx, nullptr) == MTMD_DECODE_GRANULARITY_ATOMIC) {
+        consider(budget.runtime_atomic_max);
+    }
+    budget.effective_max = eff;
+
+    return budget;
+}
+
+mtmd_counters mtmd_get_counters(const mtmd_context * ctx) {
+    mtmd_counters c{};
+    c.media_budget_adapt_total        = ctx->cnt_media_budget_adapt.load(std::memory_order_relaxed);
+    c.media_budget_reject_total       = ctx->cnt_media_budget_reject.load(std::memory_order_relaxed);
+    c.atomic_capacity_violation_total = ctx->cnt_atomic_capacity_violation.load(std::memory_order_relaxed);
+    c.dynamic_resize_total            = ctx->cnt_dynamic_resize.load(std::memory_order_relaxed);
+    c.dynamic_tiling_total            = ctx->cnt_dynamic_tiling.load(std::memory_order_relaxed);
+    return c;
 }
 
 bool mtmd_decode_use_mrope(const mtmd_context * ctx) {

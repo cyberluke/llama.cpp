@@ -139,6 +139,20 @@ int32_t mtmd_helper_decode_image_chunk(
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+
+    // generic media budget guard: an ATOMIC media block must fit the decoder
+    // capacity (min of n_batch and n_ubatch of the actual context). this makes
+    // the low-level "non-causal attention requires n_ubatch >= n_tokens"
+    // assertion unreachable through normal MTMD request handling
+    if (mtmd_get_decode_granularity(ctx, chunk) == MTMD_DECODE_GRANULARITY_ATOMIC) {
+        const int32_t capacity = (int32_t) std::min(llama_n_batch(lctx), llama_n_ubatch(lctx));
+        if (n_tokens > capacity) {
+            LOG_ERR("atomic media block has %d tokens, decoder capacity is %d (n_batch=%d, n_ubatch=%d)\n",
+                    n_tokens, capacity, (int32_t) llama_n_batch(lctx), (int32_t) llama_n_ubatch(lctx));
+            return MTMD_ERROR_ATOMIC_MEDIA_TOO_LARGE;
+        }
+    }
+
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);

@@ -1781,7 +1781,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
-    GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+    if (!cparams.causal_attn && cparams.n_ubatch < n_tokens_all) {
+        // the MTMD layer enforces this precondition for media blocks before calling
+        // llama_decode(); keep this check recoverable so an oversized non-causal
+        // request returns an error instead of aborting the process
+        LLAMA_LOG_ERROR("%s: non-causal attention requires n_ubatch >= n_tokens (n_ubatch = %u, n_tokens = %u)\n",
+                __func__, cparams.n_ubatch, n_tokens_all);
+        return -1;
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed

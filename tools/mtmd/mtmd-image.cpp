@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cinttypes>
 #include <vector>
 
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
@@ -775,20 +776,64 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     const clip_image_size original_size = img.get_size();
     // the original pixtral model doesn't have n_merge
     const int cur_merge = hparams.n_merge;
+    const int align_size = hparams.patch_size * cur_merge;
+    const int64_t patch_area = (int64_t) hparams.patch_size * hparams.patch_size * cur_merge * cur_merge;
+
+    // model-selected limit (already includes --image-max-tokens)
+    const int64_t model_max_pixels = hparams.image_max_pixels;
+
+    // candidate geometry chosen by the normal model preprocessing (no runtime limit)
+    const clip_image_size candidate_size = img_tool::calc_size_preserved_ratio(
+        original_size,
+        {
+            /* align_size   */ align_size,
+            /* min_pixels   */ hparams.image_min_pixels,
+            /* max_pixels   */ (int) model_max_pixels,
+            /* longest_edge */ 0,
+        });
+    const int64_t candidate_tokens = clip_n_output_tokens_for_size(ctx, candidate_size);
+
+    // runtime atomic decoder limit, if any: a correctness limit, it always wins
+    int64_t max_pixels = model_max_pixels;
+    if (runtime_max_output_tokens > 0) {
+        max_pixels = std::min<int64_t>(max_pixels, (int64_t) runtime_max_output_tokens * patch_area);
+    }
+
     const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
         original_size,
         {
-            /* align_size   */ hparams.patch_size * cur_merge,
+            /* align_size   */ align_size,
             /* min_pixels   */ hparams.image_min_pixels,
-            /* max_pixels   */ hparams.image_max_pixels,
+            /* max_pixels   */ (int) max_pixels,
             /* longest_edge */ 0,
         });
+
+    const bool adapted = runtime_max_output_tokens > 0 && !(target_size == candidate_size);
+
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
+
+    const int64_t processed_tokens = clip_n_output_tokens_for_size(ctx, target_size);
+    LOG_DBG("%s: media source=%dx%d candidate=%dx%d candidate_tokens=%" PRId64
+            " budget=%d processed=%dx%d processed_tokens=%" PRId64
+            " adapted=%d strategy=dynamic_resize\n",
+            __func__,
+            original_size.width, original_size.height,
+            candidate_size.width, candidate_size.height, candidate_tokens,
+            runtime_max_output_tokens,
+            target_size.width, target_size.height, processed_tokens,
+            adapted ? 1 : 0);
+    if (adapted) {
+        LOG_DBG("%s: model_candidate_tokens=%" PRId64 " runtime_effective_tokens=%" PRId64 "\n",
+                __func__, candidate_tokens, processed_tokens);
+        output.adapted = true;
+        output.adapted_strategy = MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE;
+    }
+
     return output;
 }
 
@@ -1220,6 +1265,11 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
     const int max_n_token = hparams.dsv4_max_n_token;
     const int max_wh      = hparams.dsv4_max_wh_ratio;
 
+    // connect the architecture-specific solver to the generic runtime media budget:
+    // the solver max is min(model/user max, runtime atomic capacity)
+    const bool adapted = runtime_max_output_tokens > 0 && runtime_max_output_tokens < max_n_token;
+    const int solver_max_n_token = adapted ? runtime_max_output_tokens : max_n_token;
+
     const clip_image_size orig = img.get_size();
     int width  = orig.width;
     int height = orig.height;
@@ -1234,7 +1284,12 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
     }
     int best_width  = CLIP_ALIGN(width,  p);
     int best_height = CLIP_ALIGN(height, p);
-    safe_resize(height, width, best_height, best_width, p, r, max_n_token);
+    safe_resize(height, width, best_height, best_width, p, r, solver_max_n_token);
+
+    LOG_DBG("%s: media source=%dx%d candidate_tokens=%d budget=%d processed=%dx%d"
+            " adapted=%d strategy=dynamic_resize\n",
+            __func__, orig.width, orig.height, max_n_token, solver_max_n_token,
+            best_width, best_height, adapted ? 1 : 0);
 
     clip_image_u8 resized;
     if (max_wh > 0 && orig.width >= max_wh * orig.height) {
@@ -1247,6 +1302,10 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
     }
 
     out.append(hparams, resized);
+    if (adapted) {
+        out.adapted = true;
+        out.adapted_strategy = MTMD_MEDIA_BUDGET_DYNAMIC_RESIZE;
+    }
     return out;
 }
 

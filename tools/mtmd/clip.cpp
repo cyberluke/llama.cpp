@@ -4415,6 +4415,28 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
     return n_patches;
 }
 
+int clip_n_output_tokens_for_size(const clip_ctx * ctx, clip_image_size size) {
+    if (ctx == nullptr || size.width <= 0 || size.height <= 0) {
+        return -1;
+    }
+    switch (ctx->proj_type()) {
+        case PROJECTOR_TYPE_DEEPSEEK4V:
+            // token count depends on the chunk position (lead_pad), not geometry alone
+        case PROJECTOR_TYPE_DEEPSEEKOCR:
+        case PROJECTOR_TYPE_DEEPSEEKOCR2:
+            // token count depends on the view separator / tile layout flags
+        case PROJECTOR_TYPE_GRANITE4_VISION:
+            // token count depends on the assembled anyres grid
+            return -1;
+        default:
+            break;
+    }
+    // geometry-only prediction, reuses the exact clip_n_output_tokens() semantics
+    clip_image_f32 img;
+    img.set_size(size, /* is_placeholder */ true, /* is_audio */ false);
+    return clip_n_output_tokens(ctx, &img);
+}
+
 bool clip_image_encode(struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec) {
     clip_image_f32_batch imgs;
     clip_image_f32 img_copy = *img;

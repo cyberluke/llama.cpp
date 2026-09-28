@@ -876,7 +876,17 @@ public:
     }
 
     server_metrics get_metrics() const {
-        return metrics;
+        server_metrics res = metrics;
+        if (mctx) {
+            // mirror the mtmd media budget counters into the server metrics
+            const auto c = mtmd_get_counters(mctx);
+            res.mtmd_media_budget_adapt_total        = c.media_budget_adapt_total;
+            res.mtmd_media_budget_reject_total       = c.media_budget_reject_total;
+            res.mtmd_atomic_capacity_violation_total = c.atomic_capacity_violation_total;
+            res.mtmd_dynamic_resize_total            = c.dynamic_resize_total;
+            res.mtmd_dynamic_tiling_total            = c.dynamic_tiling_total;
+        }
+        return res;
     }
 
     void reset_metrics_bucket() {
@@ -1169,6 +1179,14 @@ private:
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
+
+            // the atomic media capacity is derived from the actual initialized target
+            // context, which may differ from the CLI defaults (memory fitting, backend
+            // constraints, runtime configuration). this is a correctness limit for
+            // ATOMIC (non-causal) media blocks, not the MTMD encoder batch size
+            mparams.decode_constraints.max_atomic_tokens = (int32_t) std::min(
+                llama_n_batch(ctx_tgt),
+                llama_n_ubatch(ctx_tgt));
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
@@ -2524,7 +2542,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->metrics             = metrics;
+                    res->metrics             = get_metrics();
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();

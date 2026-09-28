@@ -75,6 +75,12 @@ const char * clip_patch_merge_type(const struct clip_ctx * ctx);
 
 int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img);
 
+// predict the number of output tokens for a given image geometry, before
+// allocating/resizing the final image. Uses the same semantics as
+// clip_n_output_tokens(). Returns -1 if the token count cannot be derived
+// from geometry alone (the exact preprocess-and-count path must be used instead).
+int clip_n_output_tokens_for_size(const clip_ctx * ctx, clip_image_size size);
+
 // for M-RoPE, this will be the number of token positions in X and Y directions
 // for other models, X will be the total number of tokens and Y will be 1
 int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img);

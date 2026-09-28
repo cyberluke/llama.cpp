@@ -187,8 +187,15 @@ struct clip_hparams {
     int32_t custom_image_min_tokens = -1;
     int32_t custom_image_max_tokens = -1;
 
+    // architecture-defined image token limits, before user overrides
+    // set by set_limit_image_tokens(); -1 if not defined by the architecture
+    int32_t model_image_min_tokens = -1;
+    int32_t model_image_max_tokens = -1;
+
     void set_limit_image_tokens(int n_tokens_min, int n_tokens_max) {
         const int patch_area = patch_size * patch_size * n_merge * n_merge;
+        model_image_min_tokens = n_tokens_min;
+        model_image_max_tokens = n_tokens_max;
         image_min_pixels = (custom_image_min_tokens > 0 ? custom_image_min_tokens : n_tokens_min) * patch_area;
         image_max_pixels = (custom_image_max_tokens > 0 ? custom_image_max_tokens : n_tokens_max) * patch_area;
         warmup_image_size = static_cast<int>(std::sqrt(image_max_pixels));
